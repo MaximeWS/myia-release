@@ -1,0 +1,467 @@
+name: Release
+
+# Fabrique, atteste et publie les binaires MyIA depuis ce dépôt public (#38).
+# Le code source vient du dépôt privé, lu avec une clé en lecture seule
+# (secrets SOURCE_* de l'environnement « validation »), après l'accord de
+# Hamza ou de Martin. Aucun code source n'est conservé ici.
+#
+#   Tag de rc   (v1.X-rcN) : controle → fabriquer (accord) → attester → publier-recette
+#                            pre-release v1.X-rcN + brouillon de prod v1.X (créé ou remplacé)
+#   Tag de prod (v1.X)     : controle → verifier-prod (accord) → publier-prod
+#                            le brouillon v1.X devient la release « latest », sans refabrication
+#
+# Règles : workflow_dispatch seul (jamais de pull_request), actions épinglées
+# par SHA, aucune donnée de l'événement par ${{ }} dans une commande, pas de
+# --debug, pas de cache.
+
+run-name: Release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag du dépôt privé : v1.X-rcN (recette) ou v1.X (prod)'
+        required: true
+        type: string
+
+permissions: {}
+
+# Une seule release à la fois : le brouillon de prod est partagé entre les runs.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NODE_VERSION: '22.14.0'
+  NPM_VERSION: '11.20.0'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Sans environnement ni secret : format du tag et branche du workflow.
+  # ---------------------------------------------------------------------------
+  controle:
+    name: Contrôler le tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      type: ${{ steps.tag.outputs.type }}
+      mineure: ${{ steps.tag.outputs.mineure }}
+      rc: ${{ steps.tag.outputs.rc }}
+    steps:
+      - name: Vérifier le format du tag
+        id: tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Le workflow se lance uniquement depuis main (reçu : $GITHUB_REF)."
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v1\.([0-9]+)(-rc([1-9][0-9]*))?$ ]]; then
+            echo "::error::Tag refusé : attendu v1.X-rcN (recette) ou v1.X (prod)."
+            exit 1
+          fi
+          mineure="${BASH_REMATCH[1]}"
+          rc="${BASH_REMATCH[3]}"
+          if [ -n "$rc" ]; then type=rc; else type=prod; fi
+          echo "Tag $TAG : $type, version 1.$mineure.0${rc:+, rc $rc}"
+          {
+            echo "type=$type"
+            echo "mineure=$mineure"
+            echo "rc=$rc"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Tag de rc : fabrication Windows et Linux, après un seul accord.
+  # ---------------------------------------------------------------------------
+  fabriquer:
+    name: Fabriquer (${{ matrix.systeme }})
+    needs: controle
+    if: needs.controle.outputs.type == 'rc'
+    environment: validation
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - systeme: windows
+            os: windows-latest
+            plateforme: --win
+            cible: nsis
+          - systeme: linux
+            os: ubuntu-latest
+            plateforme: --linux
+            cible: AppImage
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      arbre: ${{ steps.source.outputs.arbre }}
+    env:
+      TAG: ${{ inputs.tag }}
+      VERSION_ATTENDUE: 1.${{ needs.controle.outputs.mineure }}.0
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      # Historique sans contenu (blob:none) : seuls les fichiers du tag sont lus.
+      - name: Récupérer le tag du dépôt privé
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ secrets.SOURCE_DEPOT }}
+          ssh-key: ${{ secrets.SOURCE_CLE }}
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+          filter: blob:none
+          fetch-depth: 0
+          path: source
+
+      - name: Installer Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Vérifier le tag (develop, version du package)
+        id: source
+        working-directory: source
+        run: |
+          commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          arbre=$(git rev-parse "refs/tags/$TAG^{tree}")
+          if ! git merge-base --is-ancestor "$commit" origin/develop; then
+            echo "::error::Le commit du tag $TAG n'est pas sur develop : fabrication refusée."
+            exit 1
+          fi
+          version=$(node -p "require('./cpxia/package.json').version")
+          if [ "$version" != "$VERSION_ATTENDUE" ]; then
+            echo "::error::Version de cpxia/package.json ($version) différente de celle du tag $TAG ($VERSION_ATTENDUE)."
+            exit 1
+          fi
+          echo "Tag $TAG : commit $commit, arbre $arbre, version $version"
+          {
+            echo "commit=$commit"
+            echo "arbre=$arbre"
+          } >> "$GITHUB_OUTPUT"
+
+      # Plus aucun historique ni aucune référence au dépôt privé à partir d'ici.
+      - name: Retirer .git
+        run: rm -rf source/.git
+
+      - name: Utiliser la version de npm validée
+        run: npm install --global "npm@$NPM_VERSION"
+
+      # --ignore-scripts : « prepare » appelle git, absent ici ; les scripts
+      # utiles sont lancés juste après, un par un.
+      - name: Installer les dépendances
+        working-directory: source/cpxia
+        run: |
+          npm ci --ignore-scripts
+          npm run electron:fix
+          npm run native
+          npm run build:css
+
+      - name: Fabriquer la recette puis la prod
+        working-directory: source/cpxia
+        env:
+          PLATEFORME: ${{ matrix.plateforme }}
+          CIBLE: ${{ matrix.cible }}
+        run: |
+          npx electron-builder --config electron-builder.recette.js "$PLATEFORME" "$CIBLE" --publish never
+          mkdir -p sortie
+          mv dist sortie/recette
+          npx electron-builder "$PLATEFORME" "$CIBLE" --publish never
+          mv dist sortie/prod
+          ls -l sortie/recette sortie/prod
+
+      # CA-8 : aucun fichier témoin dans la prod.
+      - name: Vérifier que la prod n'embarque aucune donnée témoin
+        working-directory: source/cpxia
+        run: |
+          asar=$(find sortie/prod -name app.asar -path '*resources*' | head -n 1)
+          if [ -z "$asar" ]; then
+            echo "::error::app.asar de prod introuvable."
+            exit 1
+          fi
+          node -e "
+            const liste = require('@electron/asar').listPackage(process.argv[1]);
+            const temoins = liste.filter((f) => /test-data|temoin/i.test(f));
+            if (temoins.length) { console.error('Fichiers témoin dans la prod :\n' + temoins.join('\n')); process.exit(1); }
+            console.log('app.asar de prod : ' + liste.length + ' entrées, aucun fichier témoin.');
+          " "$asar"
+
+      # CA-3 : chaque .exe s'installe et l'application tient 30 secondes.
+      - name: Installer et lancer chaque .exe
+        if: matrix.systeme == 'windows'
+        shell: pwsh
+        working-directory: source/cpxia
+        run: |
+          Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+          $essais = @(
+            @{ Dossier = 'sortie/recette'; Nom = 'MyIA Recette' },
+            @{ Dossier = 'sortie/prod';    Nom = 'MyIA' }
+          )
+          foreach ($essai in $essais) {
+            $setup = Get-ChildItem $essai.Dossier -Filter 'MyIA*-Setup-*.exe' | Select-Object -First 1
+            if (-not $setup) { throw "Installeur introuvable dans $($essai.Dossier)." }
+            $installation = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
+            if ($installation.ExitCode -ne 0) { throw "$($setup.Name) : installation en échec (code $($installation.ExitCode))." }
+            $exe = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Recurse -Filter "$($essai.Nom).exe" | Select-Object -First 1
+            if (-not $exe) { throw "$($essai.Nom).exe introuvable après l'installation." }
+            # L'installeur peut lancer l'application : on repart d'aucune instance (verrou d'instance unique).
+            Get-Process -Name $essai.Nom -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 2
+            $appli = Start-Process -FilePath $exe.FullName -PassThru
+            Start-Sleep -Seconds 30
+            if ($appli.HasExited) { throw "$($essai.Nom) s'est arrêté avant 30 secondes (code $($appli.ExitCode))." }
+            Write-Host "$($essai.Nom) : démarré et toujours actif après 30 secondes."
+            Get-Process -Name $essai.Nom -ErrorAction SilentlyContinue | Stop-Process -Force
+          }
+
+      - name: Conserver les binaires
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaires-${{ matrix.systeme }}
+          path: |
+            source/cpxia/sortie/*/MyIA*.exe
+            source/cpxia/sortie/*/MyIA*.AppImage
+            source/cpxia/sortie/*/latest*.yml
+          retention-days: 1
+          if-no-files-found: error
+
+  attester:
+    name: Attester les binaires
+    needs: fabriquer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+      actions: read
+    steps:
+      - name: Récupérer les binaires
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binaires-*
+          path: binaires
+
+      - name: Attester la provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: binaires/**/*
+
+  publier-recette:
+    name: Publier la pre-release et le brouillon de prod
+    needs: [controle, fabriquer, attester]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      PROD: v1.${{ needs.controle.outputs.mineure }}
+      RC: ${{ needs.controle.outputs.rc }}
+      COMMIT: ${{ needs.fabriquer.outputs.commit }}
+      ARBRE: ${{ needs.fabriquer.outputs.arbre }}
+    steps:
+      - name: Récupérer les binaires
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binaires-*
+          path: binaires
+
+      - name: Vérifier les releases existantes
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "::error::Une release $TAG existe déjà sur ce dépôt. Supprime-la avant de relancer, ou pose une nouvelle rc."
+            exit 1
+          fi
+          if gh release view "$PROD" > /dev/null 2>&1; then
+            brouillon=$(gh release view "$PROD" --json isDraft --jq .isDraft)
+            if [ "$brouillon" != "true" ]; then
+              echo "::error::$PROD est déjà publiée en prod : une rc de cette version n'est plus acceptée."
+              exit 1
+            fi
+            rc_brouillon=$(gh release view "$PROD" --json body --jq .body | sed -n 's/^rc: v1\.[0-9]*-rc\([0-9]*\)$/\1/p')
+            if [ -n "$rc_brouillon" ] && [ "$rc_brouillon" -gt "$RC" ]; then
+              echo "::error::Le brouillon $PROD vient déjà de la rc $rc_brouillon, plus récente que $TAG."
+              exit 1
+            fi
+          fi
+
+      - name: Publier la pre-release de recette
+        run: |
+          shopt -s nullglob
+          fichiers=(binaires/*/recette/*)
+          printf '%s\n' "${fichiers[@]}"
+          notes="Version de recette $TAG, fabriquée et attestée par GitHub Actions. Binaires non signés : usage réservé à l'équipe et à la recette."
+          gh release create "$TAG" --prerelease --target main --title "$TAG" --notes "$notes" "${fichiers[@]}"
+
+      # Le brouillon garde la rc, le commit et l'arbre : verifier-prod les compare.
+      - name: Créer ou remplacer le brouillon de prod
+        run: |
+          shopt -s nullglob
+          if gh release view "$PROD" > /dev/null 2>&1; then
+            gh release delete "$PROD" --yes
+            echo "Ancien brouillon $PROD remplacé."
+          fi
+          fichiers=(binaires/*/prod/*)
+          printf '%s\n' "${fichiers[@]}"
+          notes=$(printf 'Version de prod %s, fabriquée avec la rc %s. Binaires non signés : usage réservé à l’équipe.\n\nrc: %s\ncommit: %s\narbre: %s\n' \
+            "$PROD" "$TAG" "$TAG" "$COMMIT" "$ARBRE")
+          gh release create "$PROD" --draft --target main --title "$PROD" --notes "$notes" "${fichiers[@]}"
+
+      - name: Résumé
+        run: |
+          {
+            echo "## $TAG publiée en pre-release"
+            echo "Brouillon de prod **$PROD** prêt (rc $TAG, commit \`$COMMIT\`)."
+            echo
+            echo '| Fichier | SHA-256 |'
+            echo '| --- | --- |'
+            find binaires -type f | sort | while read -r f; do
+              echo "| ${f#binaires/} | \`$(sha256sum "$f" | cut -d' ' -f1)\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Tag de prod : aucune fabrication. Le code du tag doit être celui de la
+  # dernière rc, et le brouillon doit venir de cette rc.
+  # ---------------------------------------------------------------------------
+  verifier-prod:
+    name: Vérifier le tag de prod
+    needs: controle
+    if: needs.controle.outputs.type == 'prod'
+    environment: validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      rc: ${{ steps.comparaison.outputs.rc }}
+      arbre: ${{ steps.comparaison.outputs.arbre }}
+    env:
+      TAG: ${{ inputs.tag }}
+      VERSION_ATTENDUE: 1.${{ needs.controle.outputs.mineure }}.0
+    steps:
+      # Seul cpxia/package.json est extrait : la comparaison porte sur l'arbre Git.
+      - name: Récupérer le tag du dépôt privé
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ secrets.SOURCE_DEPOT }}
+          ssh-key: ${{ secrets.SOURCE_CLE }}
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+          filter: blob:none
+          fetch-depth: 0
+          sparse-checkout: cpxia/package.json
+          sparse-checkout-cone-mode: false
+          path: source
+
+      - name: Comparer avec la dernière rc
+        id: comparaison
+        working-directory: source
+        run: |
+          commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          arbre=$(git rev-parse "refs/tags/$TAG^{tree}")
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::Le commit du tag $TAG n'est pas sur main : publication refusée."
+            exit 1
+          fi
+          version=$(node -p "require('./cpxia/package.json').version")
+          if [ "$version" != "$VERSION_ATTENDUE" ]; then
+            echo "::error::Version de cpxia/package.json ($version) différente de celle du tag $TAG ($VERSION_ATTENDUE)."
+            exit 1
+          fi
+          derniere=$(git tag -l "$TAG-rc*" | sed -n "s/^$TAG-rc\([1-9][0-9]*\)$/\1/p" | sort -n | tail -n 1)
+          if [ -z "$derniere" ]; then
+            echo "::error::Aucune rc $TAG-rcN sur le dépôt privé : rien à publier."
+            exit 1
+          fi
+          rc="$TAG-rc$derniere"
+          arbre_rc=$(git rev-parse "refs/tags/$rc^{tree}")
+          if [ "$arbre" != "$arbre_rc" ]; then
+            echo "::error::Le code de $TAG diffère de celui de $rc (arbre $arbre ≠ $arbre_rc). Pose une nouvelle rc, puis refais la MR."
+            exit 1
+          fi
+          echo "$TAG : même arbre que $rc ($arbre)."
+          {
+            echo "rc=$rc"
+            echo "arbre=$arbre"
+          } >> "$GITHUB_OUTPUT"
+
+  # Les brouillons ne sont lisibles qu'avec contents: write : le contrôle du
+  # brouillon et des attestations se fait ici, juste avant la publication.
+  publier-prod:
+    name: Publier la release de prod
+    needs: verifier-prod
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      RC: ${{ needs.verifier-prod.outputs.rc }}
+      ARBRE: ${{ needs.verifier-prod.outputs.arbre }}
+    steps:
+      - name: Vérifier le brouillon
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            echo "::error::Aucun brouillon $TAG : lance d'abord une rc."
+            exit 1
+          fi
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "::error::$TAG est déjà publiée."
+            exit 1
+          fi
+          corps=$(gh release view "$TAG" --json body --jq .body)
+          rc_brouillon=$(printf '%s\n' "$corps" | sed -n 's/^rc: //p')
+          arbre_brouillon=$(printf '%s\n' "$corps" | sed -n 's/^arbre: //p')
+          if [ "$rc_brouillon" != "$RC" ]; then
+            echo "::error::Le brouillon $TAG vient de ${rc_brouillon:-une rc inconnue}, pas de la dernière rc $RC."
+            exit 1
+          fi
+          if [ "$arbre_brouillon" != "$ARBRE" ]; then
+            echo "::error::L'arbre noté dans le brouillon ($arbre_brouillon) diffère de celui de $TAG ($ARBRE)."
+            exit 1
+          fi
+          echo "Brouillon $TAG : rc $RC, arbre identique."
+
+      - name: Vérifier les attestations des fichiers du brouillon
+        run: |
+          mkdir brouillon
+          gh release download "$TAG" --dir brouillon
+          if [ -z "$(ls -A brouillon)" ]; then
+            echo "::error::Le brouillon $TAG ne contient aucun fichier."
+            exit 1
+          fi
+          for f in brouillon/*; do
+            if ! gh attestation verify "$f" --repo "$GH_REPO" --signer-workflow "$GH_REPO/.github/workflows/release.yml" > /dev/null; then
+              echo "::error::Attestation invalide pour $(basename "$f")."
+              exit 1
+            fi
+            echo "$(basename "$f") : attestation valide."
+          done
+
+      # Aucun fichier téléversé : la release reprend ceux du brouillon.
+      - name: Publier le brouillon en release latest
+        run: |
+          gh release edit "$TAG" --draft=false --prerelease=false --latest --tag "$TAG" --target main
+          {
+            echo "## $TAG publiée (latest)"
+            echo "Fichiers de la rc $RC, sans refabrication."
+            echo
+            echo '| Fichier | SHA-256 |'
+            echo '| --- | --- |'
+            for f in brouillon/*; do
+              echo "| $(basename "$f") | \`$(sha256sum "$f" | cut -d' ' -f1)\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
