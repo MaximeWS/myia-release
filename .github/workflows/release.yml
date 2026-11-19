@@ -92,14 +92,15 @@ jobs:
       fail-fast: true
       matrix:
         include:
+          # Windows : installeur et portable (#69).
           - systeme: windows
             os: windows-latest
             plateforme: --win
-            cible: nsis
+            cibles: nsis portable
           - systeme: linux
             os: ubuntu-latest
             plateforme: --linux
-            cible: AppImage
+            cibles: AppImage
     outputs:
       commit: ${{ steps.source.outputs.commit }}
       arbre: ${{ steps.source.outputs.arbre }}
@@ -167,12 +168,13 @@ jobs:
         working-directory: source/cpxia
         env:
           PLATEFORME: ${{ matrix.plateforme }}
-          CIBLE: ${{ matrix.cible }}
+          CIBLES: ${{ matrix.cibles }}
         run: |
-          npx electron-builder --config electron-builder.recette.js "$PLATEFORME" "$CIBLE" --publish never
+          read -ra cibles <<< "$CIBLES"
+          npx electron-builder --config electron-builder.recette.js "$PLATEFORME" "${cibles[@]}" --publish never
           mkdir -p sortie
           mv dist sortie/recette
-          npx electron-builder "$PLATEFORME" "$CIBLE" --publish never
+          npx electron-builder "$PLATEFORME" "${cibles[@]}" --publish never
           mv dist sortie/prod
           ls -l sortie/recette sortie/prod
 
@@ -220,14 +222,41 @@ jobs:
             Get-Process -Name $essai.Nom -ErrorAction SilentlyContinue | Stop-Process -Force
           }
 
+      # #69 : chaque portable démarre sans installation et l'application tient 30 secondes.
+      # Le portable extrait l'application puis la lance : on contrôle le processus de l'application.
+      - name: Lancer chaque .exe portable
+        if: matrix.systeme == 'windows'
+        shell: pwsh
+        working-directory: source/cpxia
+        run: |
+          Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+          $essais = @(
+            @{ Dossier = 'sortie/recette'; Nom = 'MyIA Recette' },
+            @{ Dossier = 'sortie/prod';    Nom = 'MyIA' }
+          )
+          foreach ($essai in $essais) {
+            $portable = Get-ChildItem $essai.Dossier -Filter 'MyIA*-portable-*.exe' | Select-Object -First 1
+            if (-not $portable) { throw "Portable introuvable dans $($essai.Dossier)." }
+            Get-Process -Name $essai.Nom -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 2
+            $lanceur = Start-Process -FilePath $portable.FullName -PassThru
+            Start-Sleep -Seconds 30
+            $appli = Get-Process -Name $essai.Nom -ErrorAction SilentlyContinue
+            if (-not $appli) { throw "$($portable.Name) : l'application n'est plus active après 30 secondes." }
+            Write-Host "$($portable.Name) : démarré et toujours actif après 30 secondes."
+            $appli | Stop-Process -Force
+            if (-not $lanceur.HasExited) { Stop-Process -Id $lanceur.Id -Force -ErrorAction SilentlyContinue }
+          }
+
       - name: Conserver les binaires
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaires-${{ matrix.systeme }}
+          # Installeur, portable et AppImage. Pas de latest*.yml : ils ne servent qu'à
+          # la mise à jour automatique, absente de l'application (#69).
           path: |
             source/cpxia/sortie/*/MyIA*.exe
             source/cpxia/sortie/*/MyIA*.AppImage
-            source/cpxia/sortie/*/latest*.yml
           retention-days: 1
           if-no-files-found: error
 
