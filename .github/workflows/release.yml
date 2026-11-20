@@ -36,7 +36,8 @@ defaults:
     shell: bash
 
 env:
-  NODE_VERSION: '22.14.0'
+  # Node d'Electron 45, comme qualite.yml et nr.yml du dépôt privé (#54, #71).
+  NODE_VERSION: '24.22.3'
   NPM_VERSION: '11.20.0'
 
 jobs:
@@ -162,7 +163,9 @@ jobs:
           npm ci --ignore-scripts
           npm run electron:fix
           npm run native
-          npm run build:css
+          npm run build:renderer
+          # Échec tôt si l'interface chargée par l'application (#55) n'est pas fabriquée.
+          test -f out/renderer/index.html
 
       - name: Fabriquer la recette puis la prod
         working-directory: source/cpxia
@@ -191,7 +194,9 @@ jobs:
             const liste = require('@electron/asar').listPackage(process.argv[1]);
             const temoins = liste.filter((f) => /test-data|temoin/i.test(f));
             if (temoins.length) { console.error('Fichiers témoin dans la prod :\n' + temoins.join('\n')); process.exit(1); }
-            console.log('app.asar de prod : ' + liste.length + ' entrées, aucun fichier témoin.');
+            const barre = String.fromCharCode(92);
+            if (!liste.some((f) => f.split(barre).join('/').endsWith('/out/renderer/index.html'))) { console.error('interface absente de l\'app.asar de prod (#55)'); process.exit(1); }
+            console.log('app.asar de prod : ' + liste.length + ' entrées, aucun fichier témoin, interface (out/renderer/index.html) présente.');
           " "$asar"
 
       # CA-3 : chaque .exe s'installe et l'application tient 30 secondes.
